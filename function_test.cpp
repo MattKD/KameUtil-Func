@@ -2,6 +2,30 @@
 #include <cstdint>
 #include <iostream>
 #include <functional>
+#include <array>
+
+struct BigAllocator {
+  void* allocate(size_t n) 
+  { 
+    void *p = malloc(n); 
+    if (!p) {
+      throw std::bad_alloc();
+    }
+    count += 1;
+    return p;
+  }
+
+  void deallocate(void *p, size_t n) 
+  { 
+    count -= 1;
+    free(p); 
+  }
+
+  static int count;
+  std::array<char, 100> arr;
+};
+int BigAllocator::count = 0;
+
 
 static bool error_found = false;
 void logError_(bool expr, const char *msg, const char *file, int line)
@@ -23,7 +47,7 @@ int plus1(int n)
 struct PlusX {
   PlusX(int a) : x{a} { ctor_count += 1; }
   PlusX(const PlusX &other) : x{other.x} { ctor_count += 1; }
-  PlusX(PlusX &&other) : x{other.x} { ctor_count += 1; }
+  PlusX(PlusX &&other) noexcept : x{other.x} { ctor_count += 1; }
   ~PlusX() { ctor_count -= 1; }
   int operator()(int n) { return n + x; }
 
@@ -36,11 +60,15 @@ int PlusX::ctor_count = 0;
 struct LargeFunc {
   LargeFunc(int64_t a, int64_t b, int64_t c, int64_t d) 
     : a{a}, b{b}, c{c}, d{d} { ctor_count += 1; }
+
   LargeFunc(const LargeFunc &other) 
     : a{other.a}, b{other.b}, c{other.c}, d{other.d} { ctor_count += 1; }
-  LargeFunc(LargeFunc &&other)
+
+  LargeFunc(LargeFunc &&other) /*noexcept*/
     : a{other.a}, b{other.b}, c{other.c}, d{other.d} { ctor_count += 1; }
+
   ~LargeFunc() { ctor_count -= 1; }
+
   int64_t operator()() { return a + b + c + d; }
 
   int64_t a, b, c, d;
@@ -168,8 +196,21 @@ int main()
     f4 = nullptr; // assign null
     logError(!f4);
 
-    Function<void(), KameUtil::Allocator> f5; // set an allocator
-    logError(f5 == nullptr);
+    auto void_func = []() { cout << "empty func\n"; };
+    int big_alloc_count = BigAllocator::count;
+    Function<void()> f5(void_func, BigAllocator()); // set an allocator
+    logError(f5.wasAllocated());
+    logError(BigAllocator::count == big_alloc_count + 1);
+
+    { 
+      auto f6 = f5;
+      logError(BigAllocator::count == big_alloc_count + 2);
+    }
+
+    logError(BigAllocator::count == big_alloc_count + 1);
+
+    f5 = void_func; // default allocator copied into f5
+    logError(BigAllocator::count == big_alloc_count);
   }
 
   typedef Function<void()> FuncT;

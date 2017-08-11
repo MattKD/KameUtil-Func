@@ -9,7 +9,7 @@
 
 namespace KameUtil {
 
-struct Allocator {
+struct DefaultFuncAlloc {
   void* allocate(size_t n) 
   { 
     void *p = malloc(n); 
@@ -19,31 +19,30 @@ struct Allocator {
     return p;
   }
 
-  void* allocate(size_t n, size_t align) 
-  {
-    return allocate(n);
+  void deallocate(void *p, size_t n) noexcept
+  { 
+    free(p); 
   }
-
-  void deallocate(void *p, size_t n) { free(p); }
 };
 
-template <class T, class Alloc = Allocator>
+template <class T>
 class Function;
 
-template <class Alloc, class R, class ...Args>
-class Function<R(Args...), Alloc> : Alloc {
+template <class R, class ...Args>
+class Function<R(Args...)> {
 public:
-  Function() : base{nullptr} { }
-  Function(std::nullptr_t) : base{nullptr} { }
+  Function() noexcept : base{nullptr} { }
+  Function(std::nullptr_t) noexcept : base{nullptr} { }
 
-  template <class Func>
-  Function(Func f) 
+  template <class Func, class Alloc = DefaultFuncAlloc>
+  Function(Func f, Alloc alloc = Alloc())
   { 
     const bool needs_alloc = 
-      sizeof(Child<Func>) > data_size;
+      sizeof(Child<Func, Alloc>) > data_size;
     typedef typename std::conditional<needs_alloc, YesAlloc_t, 
       NoAlloc_t>::type MaybeAlloc_t;
-    init(std::move(f), MaybeAlloc_t());
+
+    init(std::move(f), MaybeAlloc_t(), std::move(alloc));
   }
 
   Function(const Function &other) 
@@ -53,8 +52,8 @@ public:
       base = other.base->clone(data);
     } else if (other.base) {
       // Needs to be allocated
-      StorageInfo si = other.base->storageInfo();
-      base = (Base*) Alloc::allocate(si.size, si.align);
+      std::size_t size = other.base->size();
+      base = (Base*) other.base->alloc(size);
       other.base->clone(base);
     } else {
       // Other is null
@@ -62,18 +61,15 @@ public:
     }
   }
 
-  Function(Function &&other) 
+  Function(Function &&other)
   {
     if (other.base == (Base*)&other.data) {
       // Fits in data buffer, not allocated
       base = other.base->move(data);
       other.reset();
     } else if (other.base) {
-      // Needs to be allocated
-      StorageInfo si = other.base->storageInfo();
-      base = (Base*) Alloc::allocate(si.size, si.align);
-      other.base->move(base);
-      other.reset();
+      base = other.base;
+      other.base = nullptr;
     } else {
       // Other is null
       base = nullptr;
@@ -85,14 +81,19 @@ public:
   { 
     reset();
     const bool needs_alloc = 
-      sizeof(Child<Func>) > data_size;
+      sizeof(Child<Func, DefaultFuncAlloc>) > data_size;
     typedef typename std::conditional<needs_alloc, YesAlloc_t, 
       NoAlloc_t>::type MaybeAlloc_t;
-    init(std::move(f), MaybeAlloc_t());
+
+    init(std::move(f), MaybeAlloc_t(), DefaultFuncAlloc());
     return *this;
   }
 
-  Function& operator=(std::nullptr_t) { reset(); return *this; }
+  Function& operator=(std::nullptr_t) noexcept  
+  { 
+    reset(); 
+    return *this; 
+  }
 
   Function& operator=(const Function &other) 
   {
@@ -103,8 +104,8 @@ public:
         base = other.base->clone(data);
       } else if (other.base) {
         // Needs to be allocated
-        StorageInfo si = other.base->storageInfo();
-        base = (Base*) Alloc::allocate(si.size, si.align);
+        std::size_t size = other.base->size();
+        base = (Base*) other.base->alloc(size);
         other.base->clone(base);
       } else {
         // Other is null
@@ -123,11 +124,8 @@ public:
         base = other.base->move(data);
         other.reset();
       } else if (other.base) {
-        // Needs to be allocated
-        StorageInfo si = other.base->storageInfo();
-        base = (Base*) Alloc::allocate(si.size, si.align);
-        other.base->move(base);
-        other.reset();
+        base = other.base;
+        other.base = nullptr;
       } else {
         // Other is null
         base = nullptr;
@@ -136,9 +134,9 @@ public:
     return *this;
   }
 
-  ~Function() { reset(); }
+  ~Function() noexcept { reset(); }
 
-  R operator()(Args ...args)
+  R operator()(Args&& ...args)
   {
     return base->call(std::forward<Args>(args)...);
   }
@@ -149,14 +147,17 @@ public:
   { 
     return !f; 
   }
+
   friend bool operator==(std::nullptr_t, const Function &f) 
   { 
     return !f; 
   }
+
   friend bool operator!=(const Function &f, std::nullptr_t) 
   { 
     return (bool)f; 
   }
+
   friend bool operator!=(std::nullptr_t, const Function &f) 
   { 
     return (bool)f; 
@@ -168,55 +169,75 @@ private:
   struct YesAlloc_t { };
   struct NoAlloc_t { };
 
-  struct StorageInfo {
-    size_t size;
-    size_t align;
-  };
-
   struct Base {
     virtual ~Base() { }
-    virtual R call(Args ...args) = 0;
-    virtual StorageInfo storageInfo() const = 0;
+    virtual R call(Args&& ...args) = 0;
+    virtual std::size_t size() const = 0;
     virtual Base* clone(void *data) = 0;
     virtual Base* move(void *data) = 0;
+    virtual void* alloc(size_t size) = 0;
+    virtual void deallocSelf() = 0;
   };
 
-  template <class Func>
-  struct Child : Base {
-    Child(Func func) : func{std::move(func)} { }
+  template <class Func, class Alloc>
+  struct Child : Base, private Alloc {
+    Child(const Func &func, const Alloc &alloc) 
+      : func{func}, Alloc(alloc) { }
 
-    R call(Args ...args) override { return func(args...); }
+    Child(Func &&func, Alloc &&alloc) 
+      : func{std::move(func)}, Alloc(std::move(alloc)) { }
+
+    R call(Args&& ...args) override 
+    { 
+      return func(std::forward<Args>(args)...); 
+    }
 
     Base* clone(void *data) override
     {
-      return new(data) Child(func);        
+      Alloc &alloc = static_cast<Alloc&>(*this);
+      return new(data) Child(func, alloc);        
     }
  
     Base* move(void *data) override
     {
-      return new(data) Child(std::move(func));        
+      Alloc &alloc = static_cast<Alloc&>(*this);
+      return new(data) Child(std::move(func), std::move(alloc));        
     }
   
-    StorageInfo storageInfo() const override
+    std::size_t size() const override
     {
-      StorageInfo si = { sizeof(Child), alignof(Child) };
-      return si;
+      return sizeof(Child);
+    }
+
+    void* alloc(size_t size) override 
+    {
+      return Alloc::allocate(size);
+    }
+
+    void deallocSelf() override 
+    {
+      // Alloc stored in Child, so copy first
+      Alloc alloc = static_cast<Alloc&>(*this);
+      this->~Child<Func, Alloc>(); // destroy self
+      alloc.deallocate(this, sizeof(Child<Func, Alloc>));
     }
 
     Func func;
   };
 
-  template <class Func>
-  void init(Func f, NoAlloc_t)
+  template <class Func, class Alloc>
+  void init(Func &&f, NoAlloc_t, Alloc &&alloc)
   {
-    base = new(&data) Child<Func>(std::move(f)); 
+    base = new(&data) Child<Func, Alloc>(std::forward<Func>(f), 
+                                         std::forward<Alloc>(alloc)); 
   }
 
-  template <class Func>
-  void init(Func f, YesAlloc_t)
+  template <class Func, class Alloc>
+  void init(Func &&f, YesAlloc_t, Alloc &&alloc)
   {
-    base = (Base*)Alloc::allocate(sizeof(Child<Func>));
-    new(base) Child<Func>(std::move(f)); 
+    base = (Base*) alloc.allocate(sizeof(Child<Func, Alloc>));
+    new(base) Child<Func, Alloc>(std::forward<Func>(f), 
+                                 std::forward<Alloc>(alloc)); 
   }
 
   void reset() 
@@ -224,9 +245,7 @@ private:
     if (base == (Base*)&data) {
       base->~Base();
     } else if (base) { 
-      StorageInfo si = base->storageInfo();
-      base->~Base();
-      Alloc::deallocate(base, si.size);
+      base->deallocSelf(); // calls dtor and deallocates
     }
     base = nullptr;
   }
@@ -239,6 +258,7 @@ private:
   };
 
   static const int data_size = sizeof(DummyT);
+
   alignas(std::max_align_t) char data[data_size];
   Base *base;
 };
