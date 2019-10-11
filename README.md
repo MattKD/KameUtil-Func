@@ -1,4 +1,4 @@
-# KameUtil-Func
+# cpp-func
 Polymorphic function in C++11
 
 For fun I wrote an almost clone of std::function. It has the same interface as std::function except in a few cases:
